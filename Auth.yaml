@@ -1,0 +1,190 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Cognito User Pool + 2 App Clients (public + confidential) + Hosted UI + SSM params + Outputs.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: Finance-information
+  Stage:
+    Type: String
+    AllowedValues: [dev, qa, prod]
+    Default: dev
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Default: https://example.com/callback      # ajusta a tu URL de prueba
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Default: https://example.com/logout        # ajusta a tu URL de prueba
+  DomainPrefix:
+    Type: String
+    Default: finance-info-dev                  # debe ser único por región
+
+Resources:
+  # ============ USER POOL ============
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-${Stage}-users'
+      UsernameAttributes: [email]                  # login por email
+      AutoVerifiedAttributes: [email]              # verifica email
+      MfaConfiguration: OFF
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  # ============ HOSTED UI DOMAIN ============
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref DomainPrefix                  # prefijo del Hosted UI
+      UserPoolId: !Ref UserPool
+
+  # ============ APP CLIENT (PÚBLICO, SIN SECRET) ============
+  # Uso: Hosted UI con OAuth Authorization Code + PKCE
+  UserPoolClientPublic:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-${Stage}-public'
+      GenerateSecret: false                      # público -> SIN secret
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlows: [code]                  # code flow (usa PKCE en frontend/test)
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  # ============ APP CLIENT (CONFIDENCIAL, CON SECRET) ============
+  # Uso típico: backend/servidor. Por ahora también code flow (server-side).
+  # (Para client_credentials necesitaremos definir un Resource Server con scopes; lo añadimos luego si lo usas.)
+  UserPoolClientConfidential:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${ProjectName}-${Stage}-confidential'
+      GenerateSecret: true                       # confidencial -> CON secret
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlows: [code]                  # code flow (intercambio de code con secret en backend)
+      AllowedOAuthScopes: [openid, email, profile]
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs: !Ref CallbackUrls
+      LogoutURLs: !Ref LogoutUrls
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+
+  # Guardamos ID + SECRET del client confidencial en Secrets Manager (para backend)
+  ConfidentialClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/confidential_client'
+      Description: 'Cognito confidential app client credentials (id + secret)'
+      SecretString: !Sub |
+        {
+          "client_id": "${UserPoolClientConfidential}",
+          "client_secret": "${UserPoolClientConfidential.ClientSecret}"
+        }
+
+  # ============ SSM PARAMS (para desacoplar y que otros stacks/servicios los lean) ============
+  SsmUserPoolId:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/user_pool_id'  # El ID del User Pool (ej. us-east-1_abcd1234). Lo usas para construir URLs, CLI, etc.
+      Type: String
+      Value: !Ref UserPool
+
+  SsmUserPoolArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/user_pool_arn'  # El ARN del User Pool (necesario en algunas políticas/IAM).
+      Type: String
+      Value: !GetAtt UserPool.Arn
+
+  SsmUserPoolClientIdPublic:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/public_client_id'  # Client ID del App Client público. Este valor será el audience de tus JWTs en API Gateway.
+      Type: String
+      Value: !Ref UserPoolClientPublic
+
+  # (Opcional) Si usas también el cliente confidencial, guarda su Client ID:
+  SsmUserPoolClientIdConfidential:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/confidential_client_id'  # Client ID del App Client confidencial (para backend/servidor).
+      Type: String
+      Value: !Ref UserPoolClientConfidential
+
+  # JWT issuer = https://cognito-idp.<region>.amazonaws.com/<userPoolId>
+  SsmJwtIssuer:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/jwt_issuer'   # URL issuer (emisor) que vendrá en el claim 'iss' del JWT y que API Gateway valida.
+      Type: String
+      Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'  # https://cognito-idp.<region>.amazonaws.com/<userPoolId>. Lo que validamos.
+
+  SsmHostedDomain:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Stage}/cognito/hosted_domain'  # URL base del Hosted UI (si lo usas). Útil para flujos OAuth (autenticación en navegador).
+      Type: String
+      Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-userpool-id'
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-userpool-arn'
+  UserPoolClientPublicId:
+    Value: !Ref UserPoolClientPublic
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-public-client-id'
+  UserPoolClientConfidentialId:
+    Value: !Ref UserPoolClientConfidential
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-confidential-client-id'
+  JwtIssuer:
+    Value: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-jwt-issuer'
+  HostedDomain:
+    Value: !Sub 'https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${ProjectName}-${Stage}-cognito-hosted-domain'
+  ConfidentialClientSecretName:
+    Value: !Ref ConfidentialClientSecret

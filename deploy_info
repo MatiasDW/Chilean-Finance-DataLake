@@ -3,3 +3,20 @@ aws cloudformation deploy \
   --template-file Finance.yaml \
   --parameter-overrides ProjectName=Finance-information Stage=dev \
   --capabilities CAPABILITY_NAMED_IAM
+
+
+
+#Issuer y Audience en Cognito, manera de revisar post creacion del recurso
+aws ssm get-parameter --name /Finance-information/dev/cognito/jwt_issuer --query Parameter.Value --output text
+aws ssm get-parameter --name /Finance-information/dev/cognito/public_client_id --query Parameter.Value --output text
+
+
+
+
+# Mini-glosario rápido
+# UserPoolId: identificador del pool (lo verás en el iss de los tokens).
+# UserPoolArn: ARN del pool (para IAM/políticas).
+# ClientId (public/confidential): identificador del App Client. El ID del cliente público suele ir en aud del ID token que usa API Gateway JWT authorizer.
+# Hosted UI: páginas de login/logout de Cognito + endpoints OAuth.
+# Issuer (iss): URL del emisor del token; API Gateway la valida.
+# SSM vs ImportValue: SSM = key/value reutilizable (menos acople); ImportValue = dependencia dura entre stacks.
