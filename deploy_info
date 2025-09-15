@@ -1,0 +1,5 @@
+aws cloudformation deploy \
+  --Finance-Scraper dl-base-dev \
+  --template-file Finance.yaml \
+  --parameter-overrides ProjectName=Finance-information Stage=dev \
+  --capabilities CAPABILITY_NAMED_IAM

@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Ingestion (Buda) — Lambda + IAM + EventBridge. Escribe RAW (json.gz) y CLEAN (CSV particionado asset/year/month/day) y crea tabla Glue con Partition Projection.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: Finance-information
+  Stage:
+    Type: String
+    AllowedValues: [dev, qa, prod]
+    Default: dev
+  ScheduleExpression:
+    Type: String
+    Default: rate(15 minutes)
+  SecretName:
+    Type: String
+    Default: /Finance-information/dev/buda-api-keys   # usa Secrets Manager para API_KEY/SECRET
+
+Resources:
+  # --- (Opcional pero útil) espejamos los nombres exportados del stack base en SSM Parameter Store ---
+  RawBucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Stage}/raw-name"
+      Type: String
+      Value: !ImportValue
+        'Fn::Sub': '${ProjectName}-${Stage}-raw-name'
+
+  CleanBucketNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Stage}/clean-name"
+      Type: String
+      Value: !ImportValue
+        'Fn::Sub': '${ProjectName}-${Stage}-clean-name'
+
+  GlueDbNameParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${ProjectName}/${Stage}/glue-db"
+      Type: String
+      Value: !ImportValue
+        'Fn::Sub': '${ProjectName}-${Stage}-glue-db'
+
+  IngestionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Stage}-ingestion-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole  # logs
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-${Stage}-s3-access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # List en ambos buckets
+              - Effect: Allow
+                Action: ['s3:ListBucket']
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-raw'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-clean'
+              # Get en ambos
+              - Effect: Allow
+                Action: ['s3:GetObject']
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-raw/*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-clean/*'
+              # Put en ambos (porque guardaremos crudo en RAW y normalizado en CLEAN)
+              - Effect: Allow
+                Action: ['s3:PutObject', 's3:AbortMultipartUpload', 's3:ListMultipartUploadParts', 's3:PutObjectTagging']
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-raw/*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Stage}-clean/*'
+        - PolicyName: !Sub '${ProjectName}-${Stage}-glue-catalog-manage'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Solo catálogo: crear/leer/actualizar tabla (sin particiones explícitas; usamos projection)
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                Resource: '*'
+        - PolicyName: !Sub '${ProjectName}-${Stage}-secrets-read'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource: '*'
+
+  IngestionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Stage}-ingestion'
+      Description: Buda → RAW(json.gz) + CLEAN(CSV particionado asset/year/month/day). Crea tabla Glue con Partition Projection.
+      Role: !GetAtt IngestionRole.Arn
+      Runtime: python3.12
+      Timeout: 90
+      MemorySize: 512
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          STAGE: !Ref Stage
+          RAW_BUCKET: !ImportValue
+            'Fn::Sub': '${ProjectName}-${Stage}-raw-name'
+          CLEAN_BUCKET: !ImportValue
+            'Fn::Sub': '${ProjectName}-${Stage}-clean-name'
+          GLUE_DATABASE: !ImportValue
+            'Fn::Sub': '${ProjectName}-${Stage}-glue-db'
+          SECRET_NAME: !Ref SecretName
+          TABLE_NAME: 'market_ticks'  # nombre de tabla en Glue/Athena
+      Code:
+        ZipFile: |
+          import os, json, io, gzip, datetime, csv, boto3, botocore, requests
+
+          def lambda_handler(event, context):
+              # =========================
+              # ENV & inputs (descriptivo)
+              # =========================
+              project_name = os.environ['PROJECT_NAME']
+              stage        = os.environ['STAGE']
+              raw_bucket   = os.environ['RAW_BUCKET']
+              clean_bucket = os.environ['CLEAN_BUCKET']
+              glue_db      = os.environ['GLUE_DATABASE']
+              table_name   = os.environ['TABLE_NAME']
+              secret_name  = os.environ.get('SECRET_NAME', '')
+
+              market = (event or {}).get('market', 'btc-clp')   # e.g., btc-clp
+              asset  = market.split('-')[0]                     # 'btc', 'eth', etc.
+
+              now = datetime.datetime.utcnow()
+              year, month, day = now.strftime('%Y'), now.strftime('%m'), now.strftime('%d')
+              iso_now = now.replace(microsecond=0).isoformat() + 'Z'
+
+              s3    = boto3.client('s3')
+              glue  = boto3.client('glue')
+              sm    = boto3.client('secretsmanager')
+
+              # =========================
+              # Secrets (opcional)
+              # =========================
+              api_key = api_secret = None
+              if secret_name:
+                  try:
+                      sec = sm.get_secret_value(SecretId=secret_name)
+                      payload = sec.get('SecretString') or '{}'
+                      obj = json.loads(payload)
+                      api_key    = obj.get('API_KEY')
+                      api_secret = obj.get('API_SECRET')
+                  except Exception as error:
+                      print(f"⚠️ No se pudo leer el Secret {secret_name}: {error}")
+
+              # =========================
+              # Fetch Buda Ticker (docs oficiales)
+              # Campos: last_price, min_ask, max_bid, volume, price_variation_24h, price_variation_7d
+              # =========================
+              url = f'https://www.buda.com/api/v2/markets/{market}/ticker.json'
+              resp = requests.get(url, timeout=10)
+              resp.raise_for_status()
+              data = resp.json()
+              tkr  = data.get('ticker', {})  # según docs de Buda
+
+              def amount_to_float(v):
+                  # Buda envía muchos campos como [amount, "CLP"] → guardamos sólo el número
+                  try:
+                      if isinstance(v, list) and v:
+                          return float(v[0])
+                      return float(v)
+                  except Exception:
+                      return None
+
+              row = {
+                  "market_id": data.get('market', {}).get('id') or market,
+                  "last_price":            amount_to_float(tkr.get("last_price")),
+                  "min_ask":               amount_to_float(tkr.get("min_ask")),
+                  "max_bid":               amount_to_float(tkr.get("max_bid")),
+                  "volume":                amount_to_float(tkr.get("volume")),
+                  "price_variation_24h":   amount_to_float(tkr.get("price_variation_24h")),
+                  "price_variation_7d":    amount_to_float(tkr.get("price_variation_7d")),
+                  "ingested_at":           iso_now
+              }
+
+              # =========================
+              # 1) RAW: guarda respuesta cruda (json.gz) — auditoría/reproceso
+              # =========================
+              raw_key = f"asset={asset}/year={year}/month={month}/day={day}/ticker_{market}_{now:%Y%m%dT%H%M%S}.json.gz"
+              raw_bytes = gzip.compress(json.dumps(data).encode("utf-8"))
+              s3.put_object(Bucket=raw_bucket, Key=raw_key, Body=raw_bytes)
+              print(f"✅ RAW escrito: s3://{raw_bucket}/{raw_key}")
+
+              # =========================
+              # 2) CLEAN: CSV normalizado + de-dupe por minuto
+              # =========================
+              clean_key = f"asset={asset}/year={year}/month={month}/day={day}/ticker_{market}_{now:%Y%m%dT%H%M}.csv"
+              wrote_clean = False
+              try:
+                  s3.head_object(Bucket=clean_bucket, Key=clean_key)
+                  print(f"ℹ️ CLEAN ya existía: {clean_key}, se evita duplicado.")
+              except botocore.exceptions.ClientError as error:
+                  if error.response.get('Error', {}).get('Code') == '404':
+                      buf = io.StringIO()
+                      writer = csv.DictWriter(buf, fieldnames=list(row.keys()))
+                      writer.writeheader(); writer.writerow(row)
+                      s3.put_object(Bucket=clean_bucket, Key=clean_key, Body=buf.getvalue().encode('utf-8'))
+                      print(f"✅ CLEAN escrito: s3://{clean_bucket}/{clean_key}")
+                      wrote_clean = True
+                  else:
+                      raise
+
+              # =========================
+              # 3) Glue Table con PARTITION PROJECTION (se crea una vez, sin registrar particiones)
+              # =========================
+              def ensure_table_with_projection():
+                  try:
+                      glue.get_table(DatabaseName=glue_db, Name=table_name)
+                      return
+                  except glue.exceptions.EntityNotFoundException:
+                      pass
+
+                  # Nota: 'storage.location.template' debe incluir TODAS las columnas de partición y terminar en '/'. (Athena) 
+                  # Athena ignorará metadatos de particiones si projection.enabled = true.
+                  tbl = {
+                      'Name': table_name,
+                      'Description': 'Buda market ticks (CSV) con partition projection: asset/year/month/day',
+                      'TableType': 'EXTERNAL_TABLE',
+                      'Parameters': {
+                          'classification': 'csv',
+                          'skip.header.line.count': '1',
+                          'EXTERNAL': 'TRUE',
+
+                          # --- Partition Projection ---
+                          'projection.enabled': 'true',
+                          'projection.asset.type':  'injected',
+                          'projection.year.type':   'integer',
+                          'projection.year.range':  '2020,2050',
+                          'projection.year.interval':'1',
+                          'projection.month.type':  'integer',
+                          'projection.month.range': '1,12',
+                          'projection.month.digits':'2',
+                          'projection.day.type':    'integer',
+                          'projection.day.range':   '1,31',
+                          'projection.day.digits':  '2',
+                          'storage.location.template': f's3://{clean_bucket}/asset=${{asset}}/year=${{year}}/month=${{month}}/day=${{day}}/'
+                      },
+                      'StorageDescriptor': {
+                          'Columns': [
+                              {'Name': 'market_id', 'Type': 'string'},
+                              {'Name': 'last_price', 'Type': 'double'},
+                              {'Name': 'min_ask', 'Type': 'double'},
+                              {'Name': 'max_bid', 'Type': 'double'},
+                              {'Name': 'volume', 'Type': 'double'},
+                              {'Name': 'price_variation_24h', 'Type': 'double'},
+                              {'Name': 'price_variation_7d', 'Type': 'double'},
+                              {'Name': 'ingested_at', 'Type': 'string'}
+                          ],
+                          'Location': f's3://{clean_bucket}/',
+                          # Hive/Serde for CSV
+                          'InputFormat':  'org.apache.hadoop.mapred.TextInputFormat',
+                          'OutputFormat': 'org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat',
+                          'SerdeInfo': {
+                              'SerializationLibrary': 'org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe',
+                              'Parameters': { 'field.delim': ',' }
+                          }
+                      },
+                      'PartitionKeys': [
+                          {'Name': 'asset', 'Type': 'string'},
+                          {'Name': 'year',  'Type': 'int'},
+                          {'Name': 'month', 'Type': 'int'},
+                          {'Name': 'day',   'Type': 'int'}
+                      ]
+                  }
+                  glue.create_table(DatabaseName=glue_db, TableInput=tbl)
+                  print(f"✅ Tabla Glue creada con projection: {glue_db}.{table_name}")
+
+              ensure_table_with_projection()
+
+              return {
+                  'ok': True,
+                  'raw_key':   raw_key,
+                  'clean_key': clean_key,
+                  'wrote_clean': wrote_clean,
+                  'table': f"{glue_db}.{table_name}"
+              }
+
+  RuleInvokeIngestion:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Stage}-ingestion-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: IngestionTarget
+          Arn: !GetAtt IngestionFunction.Arn
+          Input: !Sub |
+            {"market":"btc-clp","source":"eventbridge","stage":"${Stage}"}
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IngestionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RuleInvokeIngestion.Arn
+
+Outputs:
+  IngestionFunctionName:
+    Value: !Ref IngestionFunction
+  ScheduleName:
+    Value: !Ref RuleInvokeIngestion
